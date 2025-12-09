@@ -189,4 +189,5 @@ chunks/
 #ignore model  weights
 models/
 
-
+#openweb ui secret key
+.webui_secret_key
