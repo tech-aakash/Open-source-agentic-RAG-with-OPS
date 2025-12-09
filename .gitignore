@@ -179,3 +179,14 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+#ignore documents folder
+documents/
+
+#ignore chunks folder
+chunks/
+
+#ignore model  weights
+models/
+
+
