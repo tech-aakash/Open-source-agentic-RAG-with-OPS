@@ -191,3 +191,6 @@ models/
 
 #openweb ui secret key
 .webui_secret_key
+
+#ignore conversation logs
+conversation_memory.json
