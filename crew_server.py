@@ -63,28 +63,29 @@ class ValidatorOutput(BaseModel):
 #              FastAPI + RAG Initialization
 # ======================================================
 
-DB_NAME = "dge"
-DB_HOST = "localhost"
-DB_PORT = "5432"
-DB_USER = "aakashwalavalkar"
-DB_PASSWORD = "aakash1234"
+DB_NAME = os.getenv("DB_NAME", "dge")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_USER = os.getenv("DB_USER", "aakashwalavalkar")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "aakash1234")
 TABLE_NAME = "rag_chunks"
 
-BGE_LOCAL_DIR = (
-    "/Users/aakashwalavalkar/Desktop/Open-source-agentic-RAG-with-OPS/"
-    "models/bge-large-en-v1.5"
+# model folders will be mounted to /models in the container
+# These defaults are for when running INSIDE docker
+BGE_LOCAL_DIR = os.getenv(
+    "BGE_LOCAL_DIR",
+    "/Users/aakashwalavalkar/Desktop/Open-source-agentic-RAG-with-OPS/models/bge-large-en-v1.5"
 )
 
-# local BGE reranker path
-BGE_RERANKER_DIR = (
-    "/Users/aakashwalavalkar/Desktop/Open-source-agentic-RAG-with-OPS/"
-    "models/bge-reranker-v2-m3"
+BGE_RERANKER_DIR = os.getenv(
+    "BGE_RERANKER_DIR",
+    "/Users/aakashwalavalkar/Desktop/Open-source-agentic-RAG-with-OPS/models/bge-reranker-v2-m3"
 )
 
 EMBED_DIM = 1024
 OLLAMA_MODEL = "qwen2.5:1.5b"
-TOP_K = 5  # final number of docs LLM will see
-RERANK_RETRIEVAL_K = TOP_K * 2  # how many docs to fetch before reranking
+TOP_K = 5
+RERANK_RETRIEVAL_K = TOP_K * 2
 
 app = FastAPI(
     title="CrewAI Agentic RAG Server",
@@ -104,12 +105,13 @@ app.add_middleware(
 #          Arize Phoenix Tracing Setup
 # ======================================================
 
-# Configure Phoenix OTEL and enable automatic instrumentation (LlamaIndex, etc.)
+PHOENIX_ENDPOINT = os.getenv("PHOENIX_ENDPOINT", "http://localhost:6006/v1/traces")
+
 tracer_provider = phoenix_register(
     project_name="dge-rag-pipeline",
-    endpoint="http://localhost:6006/v1/traces",
-    auto_instrument=True,   # auto-trace supported AI libs
-    batch=True,             # batch span export
+    endpoint=PHOENIX_ENDPOINT,
+    auto_instrument=True,
+    batch=True,
 )
 
 # Phoenix-aware tracer used for decorators (chain/llm/etc.)
@@ -143,9 +145,12 @@ index = VectorStoreIndex.from_vector_store(
     embed_model=embed_model,
 )
 
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+
 print("[INIT] Loading Ollama model...")
 llm = Ollama(
     model=OLLAMA_MODEL,
+    base_url=OLLAMA_BASE_URL,
     system_prompt="You are an Abu Dhabi DGE procurement assistant."
 )
 
