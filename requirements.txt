@@ -1,0 +1,30 @@
+# --- RAG server only ---
+
+# Phoenix + tracing
+arize-phoenix
+opentelemetry-api
+opentelemetry-sdk
+
+# CrewAI (for @tool decorator) – main lib, not the giant crewai-tools bundle
+crewai
+
+# FastAPI server
+fastapi
+uvicorn[standard]
+pydantic
+
+# LlamaIndex core + postgres vector store + Ollama + HF embeddings
+llama-index
+llama-index-vector-stores-postgres
+llama-index-embeddings-huggingface
+llama-index-llms-ollama
+
+# Embeddings / reranker
+sentence-transformers
+
+# Postgres driver
+psycopg2-binary
+
+# Utilities that libs will expect
+requests
+python-dotenv
