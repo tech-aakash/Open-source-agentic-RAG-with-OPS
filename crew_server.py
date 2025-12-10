@@ -16,6 +16,7 @@ from llama_index.vector_stores.postgres import PGVectorStore
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.core.postprocessor import SentenceTransformerRerank
+
 # ========= Arize Phoenix / OpenInference Tracing =========
 from phoenix.otel import register as phoenix_register
 from opentelemetry import trace
@@ -74,7 +75,7 @@ BGE_LOCAL_DIR = (
     "models/bge-large-en-v1.5"
 )
 
-# NEW: local BGE reranker path
+# local BGE reranker path
 BGE_RERANKER_DIR = (
     "/Users/aakashwalavalkar/Desktop/Open-source-agentic-RAG-with-OPS/"
     "models/bge-reranker-v2-m3"
@@ -148,7 +149,7 @@ llm = Ollama(
     system_prompt="You are an Abu Dhabi DGE procurement assistant."
 )
 
-# NEW: BGE reranker
+# BGE reranker
 print("[INIT] Loading BGE reranker v2-m3...")
 reranker = SentenceTransformerRerank(
     model=BGE_RERANKER_DIR,  # local folder
@@ -340,6 +341,69 @@ load_memory()
 
 
 # ======================================================
+#              RAGAS LOGGING HELPERS
+# ======================================================
+
+RAGAS_LOG_FILE = "ragas_eval_data.json"
+ragas_log_lock = Lock()
+ragas_log: List[dict] = []
+
+
+def load_ragas_log():
+    """Load existing RAGAS log from disk if present."""
+    global ragas_log
+    if os.path.exists(RAGAS_LOG_FILE):
+        try:
+            with open(RAGAS_LOG_FILE, "r") as f:
+                ragas_log = json.load(f)
+            print(f"[RAGAS_LOG] Loaded {len(ragas_log)} examples from {RAGAS_LOG_FILE}")
+        except Exception as e:
+            print(f"[RAGAS_LOG] Failed to load RAGAS log, starting fresh. Error: {e}")
+            ragas_log = []
+    else:
+        print("[RAGAS_LOG] No existing RAGAS log file, starting fresh.")
+
+
+def save_ragas_log():
+    """Persist the RAGAS log to disk."""
+    try:
+        with open(RAGAS_LOG_FILE, "w") as f:
+            json.dump(ragas_log, f, indent=2)
+        print(f"[RAGAS_LOG] Saved {len(ragas_log)} examples to {RAGAS_LOG_FILE}")
+    except Exception as e:
+        print(f"[RAGAS_LOG] Failed to save RAGAS log: {e}")
+
+
+def append_ragas_example(question: str, answer: str, sources: List[dict]):
+    """
+    Append one example in the format RAGAS expects:
+
+    {
+      "question": str,
+      "answer": str,
+      "contexts": List[str],
+      "ground_truth": ""   # left blank for you to fill manually
+    }
+    """
+    contexts = [s.get("snippet", "") for s in sources]
+
+    example = {
+        "question": question,
+        "answer": answer,
+        "contexts": contexts,
+        "ground_truth": ""  # you will manually fill this later
+    }
+
+    with ragas_log_lock:
+        ragas_log.append(example)
+        save_ragas_log()
+
+
+# Load existing RAGAS log once on startup
+load_ragas_log()
+
+
+# ======================================================
 #              CORE LOGIC FUNCTIONS
 # ======================================================
 
@@ -408,7 +472,7 @@ You are a router for an Abu Dhabi DGE assistant.
 Classify the intent of the user message into EXACTLY one category:
 
 - "greeting": simple greeting or smalltalk (hi, hello, good morning, etc.).
-- "rag": any question that should use the DGE procurement RAG system.
+- "rag": any question that should use the DGE procurement, HR by Laws, Information security, ProcurementM manual(Ariba Aligned), Procurement manual(Business Process) RAG system. You can be slightly flexible here to include related questions about procurement policies, processes, thresholds, etc.
 - "other": anything else.
 
 Return ONLY a JSON object with exactly:
@@ -492,6 +556,8 @@ def rag_logic(question: str) -> dict:
             "file_name": meta.get("file_name", ""),
             "snippet": sn.node.get_content()[:500],
         }
+            # If you ever want full context instead of snippet for RAGAS,
+            # you can change "snippet" to sn.node.get_content().
         sources.append(src)
         print("[RAG] Source:", src)
 
@@ -700,6 +766,7 @@ def chat_pipeline(user_msg: str, model: str) -> str:
         span.set_attribute("dge.route", "blocked_by_guardrail")
         span.set_attribute("dge.final_answer", assistant_answer)
         update_memory(user_msg, assistant_answer)
+        # NOTE: we don't log abusive cases to RAGAS
         return assistant_answer
 
     # 2) Router
@@ -711,6 +778,7 @@ def chat_pipeline(user_msg: str, model: str) -> str:
         assistant_answer = greeting_logic(user_msg)
         span.set_attribute("dge.final_answer", assistant_answer)
         update_memory(user_msg, assistant_answer)
+        # We also don't log pure greetings to RAGAS
         return assistant_answer
 
     if router.route == "rag":
@@ -737,6 +805,14 @@ def chat_pipeline(user_msg: str, model: str) -> str:
             final_answer += "\n\nSources:\n" + "\n".join(src_lines)
 
         span.set_attribute("dge.final_answer", final_answer)
+
+        # >>> RAGAS LOGGING: only for RAG route <<<
+        append_ragas_example(
+            question=user_msg,
+            answer=final_answer,
+            sources=rag["sources"],
+        )
+
         update_memory(user_msg, final_answer)
         return final_answer
 
@@ -747,6 +823,7 @@ def chat_pipeline(user_msg: str, model: str) -> str:
     )
     span.set_attribute("dge.final_answer", assistant_answer)
     update_memory(user_msg, assistant_answer)
+    # not logged to RAGAS
     return assistant_answer
 
 
