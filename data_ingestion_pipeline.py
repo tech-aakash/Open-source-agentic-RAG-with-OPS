@@ -3,15 +3,30 @@ import re
 
 from docling.document_converter import DocumentConverter
 
+from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, StorageContext
+from llama_index.vector_stores.postgres import PGVectorStore
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
+
+# ======================================
+# PATHS – RELATIVE TO THIS FILE / REPO
+# ======================================
+
+# Repo root (assumes this file lives in the repo root)
+ROOT_DIR = Path(__file__).resolve().parent
+
+# Input docs and output chunks are subfolders of the repo
+INPUT_DIR = ROOT_DIR / "documents"
+OUTPUT_DIR = ROOT_DIR / "chunks"
+
+# Local embedding model (BGE-large) inside the repo
+MODEL_DIR = ROOT_DIR / "models" / "bge-large-en-v1.5"
+
+
 # ==========================
-# CONFIG – EDIT THESE ONLY
+# CHUNKING CONFIG
 # ==========================
 
-# Hard-coded input and output folders
-INPUT_DIR = Path("/Users/aakashwalavalkar/Desktop/Open-source-agentic-RAG-with-OPS/documents")
-OUTPUT_DIR = Path("/Users/aakashwalavalkar/Desktop/Open-source-agentic-RAG-with-OPS/chunks")
-
-# Chunking settings (character-based)
 MAX_CHARS_PER_CHUNK = 4000      # max characters in one chunk
 OVERLAP_CHARS = 400             # overlap between chunks (characters)
 
@@ -131,11 +146,64 @@ def process_folder(
             print(f"  Wrote chunk {i} -> {chunk_filename}")
 
 
+# ==========================
+# EMBEDDINGS + PGVECTOR
+# ==========================
+
+def build_pgvector_index(chunks_dir: Path):
+    """
+    Load markdown chunks from chunks_dir, embed them with BGE-large,
+    and store them in a PGVector index.
+    """
+
+    # 1. Local embedding model (BGE-large)
+    embed_model = HuggingFaceEmbedding(
+        model_name=str(MODEL_DIR),
+        normalize=True,
+    )
+
+    # 2. Configure PGVector store (hard-coded, no env)
+    vector_store = PGVectorStore.from_params(
+        database="dge",
+        host="localhost",
+        port="5432",
+        user="aakashwalavalkar",
+        password="aakash1234",
+        table_name="rag_chunks",   # table will be auto-created
+        embed_dim=1024             # MUST match BGE-large
+    )
+
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+    # 3. Load .md chunks
+    documents = SimpleDirectoryReader(str(chunks_dir)).load_data()
+
+    # 4. Build the index = embedding + inserting into PGVector
+    index = VectorStoreIndex.from_documents(
+        documents,
+        storage_context=storage_context,
+        embed_model=embed_model,
+    )
+
+    print("RAG index created & stored in PostgreSQL 'dge.rag_chunks'")
+    return index
+
+
+# ==========================
+# MAIN PIPELINE
+# ==========================
+
 if __name__ == "__main__":
+    print(f"Repo root: {ROOT_DIR}")
+    print("Step 1: converting documents -> chunks ...")
     process_folder(
         input_dir=INPUT_DIR,
         output_dir=OUTPUT_DIR,
         max_chars=MAX_CHARS_PER_CHUNK,
         overlap_chars=OVERLAP_CHARS,
     )
-    print("Done.")
+
+    print("\nStep 2: building PGVector index from chunks ...")
+    build_pgvector_index(OUTPUT_DIR)
+
+    print("\nDone.")
