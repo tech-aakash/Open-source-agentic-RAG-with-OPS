@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel
-from typing import List, Literal
+from typing import List, Literal, Optional
 import json
 import time
 import os
@@ -50,13 +50,20 @@ class GuardrailOutput(BaseModel):
 
 
 class RouterOutput(BaseModel):
-    route: Literal["greeting", "rag", "other"]
+    # includes follow_up route
+    route: Literal["greeting", "rag", "follow_up", "other"]
     reason: str
 
 
 class ValidatorOutput(BaseModel):
     is_valid: bool
     feedback: str
+
+
+class RewriterOutput(BaseModel):
+    is_follow_up: bool
+    rewritten_question: str
+    reason: str
 
 
 # ======================================================
@@ -183,6 +190,10 @@ conversation_state = {
     "summaries": [],
 }
 
+# Last RAG Q&A kept in memory for follow-up routing/rewriting
+last_rag_question: Optional[str] = None
+last_rag_answer: Optional[str] = None
+
 
 def load_memory():
     global conversation_state
@@ -275,72 +286,6 @@ def update_memory(user_msg: str, assistant_msg: str):
         save_memory()
 
 
-def get_memory_summaries_text(max_summaries: int = 5) -> str:
-    """
-    Returns a concatenated text of recent conversation summaries.
-    """
-    with memory_lock:
-        summaries = conversation_state.get("summaries", [])
-        if not summaries:
-            return ""
-
-        recent = summaries[-max_summaries:]
-        lines = []
-        for s in recent:
-            idx = s.get("window_index", "?")
-            lines.append(f"Window {idx}:\n{s.get('summary', '')}")
-        memory_text = "\n\n".join(lines)
-        print("[MEMORY] Using the following summaries for context:\n", memory_text)
-        return memory_text
-
-
-@tracer.chain
-def enhance_with_memory(question: str, rag_answer: str) -> str:
-    """
-    Take the RAG answer and refine it using stored conversation memory (summaries).
-    If no memory is available, return rag_answer unchanged.
-    """
-    span = trace.get_current_span()
-    span.set_attribute("dge.component", "memory_enhance")
-    span.set_attribute("dge.user_question", question)
-
-    mem_text = get_memory_summaries_text()
-    if not mem_text.strip():
-        span.set_attribute("dge.memory.has_memory", False)
-        return rag_answer
-
-    span.set_attribute("dge.memory.has_memory", True)
-    span.set_attribute("dge.rag_answer_before", rag_answer)
-
-    prompt = f"""
-You are an Abu Dhabi DGE procurement assistant.
-
-You have a draft answer based on current procurement documents:
-
-DRAFT ANSWER:
-{rag_answer}
-
-You also have summaries of this user's previous conversation with you:
-
-CONVERSATION MEMORY:
-{mem_text}
-
-Task:
-- If the memory is relevant to the current question, slightly refine or extend the draft answer
-  to maintain continuity, recall their previous questions, or clarify related policies.
-- Do NOT change factual details that come from the procurement standards.
-- If the memory is not relevant, just return the draft answer as-is.
-
-Return ONLY the final answer text.
-"""
-
-    out = llm.complete(prompt)
-    final_answer = str(out).strip()
-    print("[MEMORY] Enhanced answer with memory.")
-    span.set_attribute("dge.rag_answer_after", final_answer)
-    return final_answer
-
-
 # Load existing memory once on startup
 load_memory()
 
@@ -387,7 +332,7 @@ def append_ragas_example(question: str, answer: str, sources: List[dict]):
       "question": str,
       "answer": str,
       "contexts": List[str],
-      "ground_truth": ""   # left blank for you to fill manually
+      "ground_truth": ""   # you will manually fill later
     }
     """
     contexts = [s.get("snippet", "") for s in sources]
@@ -464,34 +409,64 @@ User message:
 
 @tracer.chain
 def router_logic(question: str) -> RouterOutput:
-    """Route query intent to greeting / rag / other."""
+    """
+    Route query intent to greeting / rag / follow_up / other.
+
+    Router is aware of the LAST RAG question and answer to better detect follow-ups.
+    """
+    global last_rag_question, last_rag_answer
+
     span = trace.get_current_span()
     span.set_attribute("dge.component", "router")
     span.set_attribute("dge.user_question", question)
 
     print(f"[ROUTER] Input: {question!r}")
+    print("[ROUTER] Last RAG question:", repr(last_rag_question))
+    print("[ROUTER] Last RAG answer:", repr(last_rag_answer))
+
+    last_q = last_rag_question or ""
+    last_a = last_rag_answer or ""
 
     prompt = f"""
 You are a router for an Abu Dhabi DGE assistant.
 
-Classify the intent of the user message into EXACTLY one category:
+You must classify the CURRENT user message into EXACTLY one category:
 
 - "greeting": simple greeting or smalltalk (hi, hello, good morning, etc.).
-- "rag": any question that should use the DGE procurement, HR by Laws, Information security, ProcurementM manual(Ariba Aligned), Procurement manual(Business Process) RAG system. You can be slightly flexible here to include related questions about procurement policies, processes, thresholds, etc.
-- "other": anything else.
+- "follow_up": a short or vague message that clearly depends on the previous procurement-related Q&A
+  (for example, uses pronouns like "it", "this", "that", or phrases like "tell me more", "can you explain more",
+   and is about the same topic as the last RAG question and answer).
+- "rag": a new, self-contained question that should use the DGE procurement / HR by Laws / Information security /
+  Procurement manual (Ariba Aligned or Business Process) RAG system.
+  It mentions its topic explicitly (e.g., thresholds, exceptions, conflicts of interest, annexes, articles, etc.).
+- "other": anything else that is not a greeting and not about the DGE RAG content.
+
+You are given:
+- CURRENT_MESSAGE: what the user just wrote
+- LAST_RAG_QUESTION: the last procurement question that was sent to the RAG system (may be empty)
+- LAST_RAG_ANSWER: the last answer from the RAG system (may be empty)
+
+If the CURRENT_MESSAGE is clearly referring back to the LAST_RAG_QUESTION/ANSWER (e.g., "can you tell me more about it?",
+"what about the thresholds you mentioned?", "and what are the risks?"), classify as "follow_up".
 
 Return ONLY a JSON object with exactly:
-- "route": "greeting" | "rag" | "other"
+- "route": "greeting" | "rag" | "follow_up" | "other"
 - "reason": short explanation
 
-Example:
+Example for follow_up:
 {{
-  "route": "greeting",
-  "reason": "The message is just 'Hi'."
+  "route": "follow_up",
+  "reason": "The message 'can you tell me more about this?' refers back to the previous question about exceptions."
 }}
 
-User message:
+CURRENT_MESSAGE:
 "{question}"
+
+LAST_RAG_QUESTION:
+"{last_q}"
+
+LAST_RAG_ANSWER:
+"{last_a}"
 """
 
     raw = str(llm.complete(prompt)).strip()
@@ -510,6 +485,7 @@ User message:
     except Exception as e:
         print("[ROUTER] JSON parse/validation error:", e)
         span.set_attribute("dge.router.error", str(e))
+        # Fallback: default to "rag"
         return RouterOutput(
             route="rag",
             reason="Failed to parse model output; defaulting to rag.",
@@ -561,8 +537,6 @@ def rag_logic(question: str) -> dict:
             "file_name": meta.get("file_name", ""),
             "snippet": sn.node.get_content()[:500],
         }
-            # If you ever want full context instead of snippet for RAGAS,
-            # you can change "snippet" to sn.node.get_content().
         sources.append(src)
         print("[RAG] Source:", src)
 
@@ -643,6 +617,90 @@ ANSWER:
         )
 
 
+@tracer.chain
+def rewriter_logic(current_question: str, last_question: str, last_answer: str) -> RewriterOutput:
+    """
+    Decide if the current question is a follow-up to the last RAG question/answer.
+    If it is, rewrite it into a fully self-contained question that includes context.
+    """
+    span = trace.get_current_span()
+    span.set_attribute("dge.component", "rewriter")
+    span.set_attribute("dge.current_question", current_question)
+    span.set_attribute("dge.last_rag_question", last_question)
+
+    print("[REWRITER] Current question:", current_question)
+    print("[REWRITER] Last RAG question:", last_question)
+    print("[REWRITER] Last RAG answer:", last_answer)
+
+    prompt = f"""
+You are a query rewriter for a procurement RAG system.
+
+You are given:
+- The user's CURRENT message
+- The LAST procurement-related user question
+- The assistant's LAST answer
+
+Your tasks:
+1. Decide if the CURRENT message is a follow-up that relies on the previous Q&A
+   (e.g., uses pronouns like "it", "that", "this", "more details", "tell me more", or clearly refers to the same topic).
+2. If it IS a follow-up, rewrite the CURRENT message into a fully self-contained question
+   that includes the necessary context from the previous Q&A.
+3. If it is NOT a follow-up, simply copy the CURRENT message as-is.
+
+Return ONLY a JSON object with:
+- "is_follow_up": true or false
+- "rewritten_question": the full, explicit question to send to RAG
+- "reason": a very short explanation
+
+Example when it IS a follow-up:
+{{
+  "is_follow_up": true,
+  "rewritten_question": "Can you provide more details about the definition of 'Critical Entity' as provided in Annex F of the UAE IA Standards?",
+  "reason": "The user said 'tell me more about it', referring to the last question."
+}}
+
+Example when it is NOT a follow-up:
+{{
+  "is_follow_up": false,
+  "rewritten_question": "What are the KPIs for procurement performance?",
+  "reason": "The user asked about a new topic unrelated to the last Q&A."
+}}
+
+CURRENT message:
+"{current_question}"
+
+LAST user question:
+"{last_question}"
+
+LAST assistant answer:
+"{last_answer}"
+"""
+
+    raw = str(llm.complete(prompt)).strip()
+    print("[REWRITER] Raw LLM output:", raw)
+
+    clean = extract_json(raw)
+    print("[REWRITER] Extracted JSON candidate:", clean)
+
+    try:
+        data = json.loads(clean)
+        result = RewriterOutput(**data)
+        print("[REWRITER] Parsed RewriterOutput:", result)
+        span.set_attribute("dge.rewriter.is_follow_up", result.is_follow_up)
+        span.set_attribute("dge.rewriter.reason", result.reason)
+        span.set_attribute("dge.rewriter.rewritten_question", result.rewritten_question)
+        return result
+    except Exception as e:
+        print("[REWRITER] JSON parse/validation error:", e)
+        span.set_attribute("dge.rewriter.error", str(e))
+        # Fallback: not a follow-up, keep original question
+        return RewriterOutput(
+            is_follow_up=False,
+            rewritten_question=current_question,
+            reason="Failed to parse rewriter output; treating as not a follow-up.",
+        )
+
+
 # ======================================================
 #              CREWAI TOOL WRAPPERS
 # ======================================================
@@ -656,7 +714,7 @@ def t_guardrail(question: str) -> str:
 
 @tool("dge_router_tool")
 def t_router(question: str) -> str:
-    """CrewAI tool: decide if query should go to greeting or rag."""
+    """CrewAI tool: decide if query should go to greeting, rag, follow_up, or other."""
     result = router_logic(question)
     return result.json()
 
@@ -690,6 +748,27 @@ def t_validator(payload: str) -> str:
         data["question"],
         data["sources_json"],
         data["answer"],
+    )
+    return result.json()
+
+
+@tool("dge_rewriter_tool")
+def t_rewriter(payload: str) -> str:
+    """
+    CrewAI tool: rewrite a follow-up question into a full question if needed.
+
+    Payload must be JSON:
+    {
+      "current_question": "...",
+      "last_question": "...",
+      "last_answer": "..."
+    }
+    """
+    data = json.loads(payload)
+    result = rewriter_logic(
+        data["current_question"],
+        data["last_question"],
+        data["last_answer"],
     )
     return result.json()
 
@@ -751,10 +830,16 @@ def build_response(model: str, content: str) -> ChatCompletionResponse:
 def chat_pipeline(user_msg: str, model: str) -> str:
     """
     Core chat pipeline used by the FastAPI endpoint.
-    This is the span where you'll see:
-    - Input: user_msg, model
-    - Output: final_answer
+
+    Routing logic:
+
+    - greeting  -> greeting_logic only
+    - rag       -> direct RAG (no rewriter)
+    - follow_up -> rewriter + RAG
+    - other     -> generic domain message
     """
+    global last_rag_question, last_rag_answer
+
     span = trace.get_current_span()
     span.set_attribute("dge.component", "chat_pipeline")
     span.set_attribute("dge.user_question", user_msg)
@@ -779,6 +864,7 @@ def chat_pipeline(user_msg: str, model: str) -> str:
     span.set_attribute("dge.route", router.route)
     span.set_attribute("dge.router.reason", router.reason)
 
+    # 3) Greeting route -> greeting only
     if router.route == "greeting":
         assistant_answer = greeting_logic(user_msg)
         span.set_attribute("dge.final_answer", assistant_answer)
@@ -786,19 +872,46 @@ def chat_pipeline(user_msg: str, model: str) -> str:
         # We also don't log pure greetings to RAGAS
         return assistant_answer
 
+    # Prepare question that will go to RAG
+    question_for_rag = user_msg
+
+    # 4) Follow-up route -> rewriter + RAG
+    if router.route == "follow_up":
+        if last_rag_question and last_rag_answer:
+            rew = rewriter_logic(user_msg, last_rag_question, last_rag_answer)
+            span.set_attribute("dge.rewriter.is_follow_up", rew.is_follow_up)
+            span.set_attribute("dge.rewriter.reason", rew.reason)
+            span.set_attribute("dge.rewriter.rewritten_question", rew.rewritten_question)
+
+            if rew.is_follow_up:
+                question_for_rag = rew.rewritten_question
+            else:
+                # Rewriter decided it's not really a follow-up; treat as direct RAG query
+                question_for_rag = user_msg
+        else:
+            # No previous RAG context; treat as direct RAG
+            question_for_rag = user_msg
+
+    # 5) Direct RAG route -> RAG only (no rewriter)
     if router.route == "rag":
+        question_for_rag = user_msg
+
+    # If router.route is "rag" or "follow_up", run the RAG pipeline
+    if router.route in ("rag", "follow_up"):
         # Run RAG
-        rag = rag_logic(user_msg)
+        rag = rag_logic(question_for_rag)
+        answer_text = rag["answer"]
 
-        # Enhance with memory summaries, if any
-        enriched_answer = enhance_with_memory(user_msg, rag["answer"])
-
-        # Validate the enriched answer
-        validator = validator_logic(user_msg, json.dumps(rag["sources"]), enriched_answer)
+        # Validate the answer
+        validator = validator_logic(
+            question_for_rag,
+            json.dumps(rag["sources"]),
+            answer_text,
+        )
         span.set_attribute("dge.validator.is_valid", validator.is_valid)
         span.set_attribute("dge.validator.feedback", validator.feedback)
 
-        final_answer = enriched_answer
+        final_answer = answer_text
         if not validator.is_valid:
             final_answer += f"\n\n[Validator note] {validator.feedback}"
 
@@ -811,17 +924,22 @@ def chat_pipeline(user_msg: str, model: str) -> str:
 
         span.set_attribute("dge.final_answer", final_answer)
 
-        # >>> RAGAS LOGGING: only for RAG route <<<
+        # >>> RAGAS LOGGING: only for RAG-related routes <<<
         append_ragas_example(
-            question=user_msg,
+            question=question_for_rag,
             answer=final_answer,
             sources=rag["sources"],
         )
 
         update_memory(user_msg, final_answer)
+
+        # Update last RAG Q&A for future follow-up detection
+        last_rag_question = question_for_rag
+        last_rag_answer = final_answer
+
         return final_answer
 
-    # route == "other"
+    # 6) route == "other" -> generic domain message
     assistant_answer = (
         "I mainly help with Abu Dhabi DGE procurement policies and processes. "
         "Please ask a procurement-related question."
