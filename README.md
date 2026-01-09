@@ -474,7 +474,3 @@ Once these steps are followed, anyone can rebuild and run the **exact same proje
   - If you don’t need tracing, you can change `PHOENIX_ENDPOINT` to a dummy value or disable Phoenix in code.
   - Otherwise, ensure Phoenix is running at `http://localhost:6006/v1/traces` on the host.
 
----
-
-Happy hacking! 🎯  
-If you push this project to GitHub, simply add this `README.md` to the repository root so anyone can follow these steps to rebuild the entire stack.
